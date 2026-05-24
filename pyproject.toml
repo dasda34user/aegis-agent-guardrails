@@ -8,6 +8,7 @@ dependencies = [
     "langchain-core>=1.4.0",
     "langchain-openai>=1.2.2",
     "python-dotenv>=1.2.2",
+    "pyyaml>=6.0.3",
 ]
 
 [[tool.uv.index]]

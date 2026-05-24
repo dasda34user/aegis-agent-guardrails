@@ -434,6 +434,87 @@ class AegisGuard:
         entry.execution_time_ms = (time.time() - start_time) * 1000
         self.logger.record(entry)
 
+    def validate_deep(self, prompt: str, action_plan: List[Dict] = None,
+                       agent_output: str = "", context: Dict = None) -> Dict:
+        """
+        深度护栏校验 — 正则 + LLM 双层。
+
+        Layer 1: 正则快速过滤 → LLM 语义确认（无论正则是否通过）
+        Layer 2: 策略引擎（Policy-as-Code）
+        Layer 3: 正则格式/有害/越权 + LLM 幻觉检测
+        """
+        from .deep_engine import deep_layer1, deep_layer3
+
+        trace_id = str(uuid.uuid4())[:8]
+        start_time = time.time()
+        log_entry = DecisionLog(
+            trace_id=trace_id,
+            timestamp=datetime.now().isoformat(),
+            agent_name=context.get("agent_name", "default") if context else "default",
+            input_prompt=prompt[:200]
+        )
+
+        results = {"trace_id": trace_id}
+
+        # Layer 1: Regex + LLM
+        l1_regex = layer1_input_guard(prompt)
+        l1 = deep_layer1(prompt, {
+            "passed": l1_regex.passed,
+            "risk_level": l1_regex.risk_level,
+            "checks": l1_regex.checks,
+        })
+        results["layer1"] = l1
+        log_entry.layer1_result = {"passed": l1["passed"], "risk": l1.get("risk", "?"),
+                                    "method": l1.get("method", "?"), "summary": l1.get("summary", "")}
+        if not l1.get("passed", True):
+            log_entry.final_verdict = "blocked_by_input_guard"
+            log_entry.risk_flags.append("L1_BLOCKED")
+            results["verdict"] = "BLOCKED"
+            results["blocked_at"] = f"Layer 1 ({l1.get('method', '?')})"
+            self.blocked_count += 1
+            self._log(log_entry, start_time)
+            return results
+
+        # Layer 2: Policy-as-Code (if action_plan provided)
+        if action_plan:
+            from .policy_engine import PolicyEngine
+            pe = PolicyEngine()
+            l2 = pe.validate_plan(action_plan)
+            results["layer2"] = l2
+            log_entry.layer2_result = {"passed": l2["passed"], "risk": "high" if not l2["passed"] else "none"}
+            if not l2.get("passed", False):
+                log_entry.final_verdict = "blocked_by_action_guard"
+                log_entry.risk_flags.append("L2_BLOCKED")
+                results["verdict"] = "BLOCKED"
+                results["blocked_at"] = "Layer 2 (Policy-as-Code)"
+                self.blocked_count += 1
+                self._log(log_entry, start_time)
+                return results
+
+        # Layer 3: Regex + LLM hallucination check
+        l3_regex = layer3_output_guard(agent_output) if agent_output else None
+        l3 = deep_layer3(agent_output, {
+            "passed": l3_regex.passed if l3_regex else True,
+            "risk_level": l3_regex.risk_level if l3_regex else "none",
+        }, context=context)
+        results["layer3"] = l3
+        log_entry.layer3_result = {"passed": l3.get("passed", True), "risk": l3.get("risk", "?"),
+                                    "method": l3.get("method", "?"), "summary": l3.get("summary", "")}
+        if not l3.get("passed", True):
+            log_entry.final_verdict = "blocked_by_output_guard"
+            log_entry.risk_flags.append("L3_BLOCKED")
+            results["verdict"] = "BLOCKED"
+            results["blocked_at"] = f"Layer 3 ({l3.get('method', '?')})"
+            self.blocked_count += 1
+            self._log(log_entry, start_time)
+            return results
+
+        results["verdict"] = "PASSED"
+        log_entry.final_verdict = "passed"
+        self.total_checks += 1
+        self._log(log_entry, start_time)
+        return results
+
     def get_stats(self) -> Dict:
         """获取统计信息"""
         return {
